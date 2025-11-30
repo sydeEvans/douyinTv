@@ -27,7 +27,7 @@ interface DouyinApi {
         @Query("creative_id") creativeId: String = "",
         @Query("pc_client_type") pcClientType: Int = 1,
         @Query("pc_libra_divert") pcLibraDivert: String = "Mac",
-        @Query("support_h265") supportH265: Int = 1,
+        @Query("support_h265") supportH265: Int = 0,
         @Query("support_dash") supportDash: Int = 1,
         @Query("webcast_sdk_version") webcastSdkVersion: Int = 170400,
         @Query("webcast_version_code") webcastVersionCode: Int = 170400,

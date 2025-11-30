@@ -11,14 +11,24 @@ android {
         applicationId "com.example.douyintv"
         minSdk 21
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "1.0.1"
+    }
+
+    signingConfigs {
+        release {
+            storeFile file(project.findProperty('RELEASE_STORE_FILE') ?: 'release.keystore')
+            storePassword project.findProperty('RELEASE_STORE_PASSWORD') ?: ''
+            keyAlias project.findProperty('RELEASE_KEY_ALIAS') ?: 'release'
+            keyPassword project.findProperty('RELEASE_KEY_PASSWORD') ?: ''
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
         }
     }
     compileOptions {
@@ -30,6 +40,17 @@ android {
     }
 }
 
+// 为 release 构建产物文件名加入时间戳（AGP 8.x 新 API）
+androidComponents {
+    onVariants(selector().withBuildType("release")) { variant ->
+        def ts = new Date().format("yyyyMMdd-HHmmss")
+        variant.outputs.forEach { output ->
+            // Avoid accessing missing variant.versionName in AGP 8.x
+            output.outputFileName.set("${variant.applicationId.get()}-${variant.name}-${ts}.apk")
+        }
+    }
+}
+
 dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
@@ -38,6 +59,7 @@ dependencies {
     
     // ExoPlayer
     implementation 'androidx.media3:media3-exoplayer:1.2.0'
+    implementation 'androidx.media3:media3-exoplayer-hls:1.2.0'
     implementation 'androidx.media3:media3-ui:1.2.0'
     implementation 'androidx.media3:media3-common:1.2.0'
 
@@ -51,4 +73,7 @@ dependencies {
     
     // Glide for images
     implementation 'com.github.bumptech.glide:glide:4.16.0'
+
+    // GSYVideoPlayer（JitPack）
+    implementation 'com.github.CarGuo.GSYVideoPlayer:GSYVideoPlayer:v8.3.3-release-jitpack'
 }

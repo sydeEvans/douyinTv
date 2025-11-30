@@ -8,13 +8,15 @@ import android.widget.TextView
 import android.widget.LinearLayout
 import android.widget.FrameLayout
 import android.widget.Toast
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
+import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.DefaultTimeBar
-import androidx.media3.ui.PlayerView
+import androidx.media3.common.MimeTypes
+import com.shuyu.gsyvideoplayer.GSYVideoManager
+import com.shuyu.gsyvideoplayer.video.StandardGSYVideoPlayer
+import com.shuyu.gsyvideoplayer.video.base.GSYVideoView
 import com.example.douyintv.data.Aweme
 import com.example.douyintv.data.NetworkClient
 import kotlinx.coroutines.Dispatchers
@@ -25,21 +27,21 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var player: ExoPlayer
-    private lateinit var playerView: PlayerView
+    private lateinit var gsyPlayer: StandardGSYVideoPlayer
     private lateinit var loadingBar: ProgressBar
-    private lateinit var pauseOverlay: TextView
-    private lateinit var timeBarContainer: LinearLayout
-    private lateinit var timeBar: DefaultTimeBar
-    private lateinit var timeText: TextView
     private lateinit var infoOverlayContainer: LinearLayout
     private lateinit var infoTitle: TextView
     private lateinit var infoDate: TextView
-    private var hideTimeBarJob: Job? = null
-    private var seekDebounceJob: Job? = null
-    private var pendingSeekOffsetMs: Long = 0L
-    private val SEEK_STEP_MS = 5_000L
     private var infoAutoHideJob: Job? = null
+    private var hevcSupportedCache: Boolean? = null
+    private var firstFrameRendered: Boolean = false
+    private var renderWatchdogJob: Job? = null
+    private val SEEK_SHORT_MS = 5_000L
+    private val SEEK_LONG_STEP_MS = 5_000L
+    private val SEEK_LONG_INTERVAL_MS = 300L
+    private var seekHoldJob: Job? = null
+    private var seekHoldDirection: Int = 0 // -1: back, +1: forward
+    private var holdTargetPosition: Long = -1L
 
     private val awemeList = mutableListOf<Aweme>()
     private var currentIndex = 0
@@ -49,12 +51,8 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        playerView = findViewById(R.id.player_view)
+        gsyPlayer = findViewById(R.id.gsy_player)
         loadingBar = findViewById(R.id.loading_bar)
-        pauseOverlay = findViewById(R.id.pause_overlay)
-        timeBarContainer = findViewById(R.id.time_bar_container)
-        timeBar = findViewById(R.id.time_bar)
-        timeText = findViewById(R.id.time_text)
         infoOverlayContainer = findViewById(R.id.info_overlay_container)
         infoTitle = findViewById(R.id.info_title)
         infoDate = findViewById(R.id.info_date)
@@ -64,10 +62,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun initializePlayer() {
-        player = ExoPlayer.Builder(this).build()
-        playerView.player = player
-        player.repeatMode = Player.REPEAT_MODE_ONE // Loop current video
-        player.playWhenReady = true
+        gsyPlayer.isFocusable = true
+        gsyPlayer.isFocusableInTouchMode = true
+        gsyPlayer.requestFocus()
+        gsyPlayer.setDismissControlTime(2000)
     }
 
     private fun loadFeed() {
@@ -84,7 +82,8 @@ class MainActivity : AppCompatActivity() {
                     aBogus = "EJUVDtU7mZRfFV%2FbuOk6C3lUnKyMrTSyjMioRPpPexOyOwzcESPpBxaPboK8uctqK8BhkK57%2FxeAYEdbsTXsZCekLmZkSZsjm05AnSfL0Z71Y4JgvqSsCYbEFk-TlS4YuQIXi%2F65UssJ2D56IqCzAQ-yw%2FUrBbfD0N-tV2YaP2csBSWc2iFQYoEXtkvKUVdR",
                     xSecsdkWebExpire = 1764489350548,
                     xSecsdkWebSignature = "ee08cad39a1beaf818a2eaa6fd819bd2",
-                    uifid = "b7ffea4ffb7fd578f49f51586a953ac3b119cdf53ef4e59d8d754c665e367392c6fa7212377a2f91aa608515849d5e32ae00510f967dbfa3033f93de0f22b5198307a376dfc9508a5a17f47234068ba6c5fea8102c1efa91aa5a4ec02dd060589ef5627d2c7a092f35f7ca0f6449f35932e3e4bf6b2678abecebb270beab0a956d4d7532a08a523416e12834dc51c78d1dbeccc760698f265083dd73d3da252c98ea5d0ad72039a2e8ed8df7419129e7e186aa565cd71fd506191efaa79831d0"
+                    uifid = "b7ffea4ffb7fd578f49f51586a953ac3b119cdf53ef4e59d8d754c665e367392c6fa7212377a2f91aa608515849d5e32ae00510f967dbfa3033f93de0f22b5198307a376dfc9508a5a17f47234068ba6c5fea8102c1efa91aa5a4ec02dd060589ef5627d2c7a092f35f7ca0f6449f35932e3e4bf6b2678abecebb270beab0a956d4d7532a08a523416e12834dc51c78d1dbeccc760698f265083dd73d3da252c98ea5d0ad72039a2e8ed8df7419129e7e186aa565cd71fd506191efaa79831d0",
+                    supportH265 = if (isHevcSupported()) 1 else 0
                 )
                 
                 withContext(Dispatchers.Main) {
@@ -117,23 +116,16 @@ class MainActivity : AppCompatActivity() {
         if (index < 0 || index >= awemeList.size) return
         currentIndex = index
 
-        // 构建当前与下一条的播放列表，以便预加载下一条视频
-        val currentItem = buildMediaItemForIndex(index)
-        if (currentItem == null) {
+        val currentUrl = buildUrlForIndex(index)
+        if (currentUrl == null) {
             Toast.makeText(this, "No valid video URL found", Toast.LENGTH_SHORT).show()
             return
         }
 
-        val nextItem = buildMediaItemForIndex(index + 1)
-
-        player.stop()
-        player.clearMediaItems()
-        player.addMediaItem(currentItem)
-        if (nextItem != null) {
-            player.addMediaItem(nextItem)
-        }
-        player.prepare()
-        player.play()
+        gsyPlayer.setUp(currentUrl, false, "")
+        gsyPlayer.startPlayLogic()
+        // 播放时保持屏幕常亮
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         showInfoOverlayForStart(index)
 
@@ -143,19 +135,98 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun buildMediaItemForIndex(index: Int): MediaItem? {
+    private fun buildUrlForIndex(index: Int): String? {
         if (index < 0 || index >= awemeList.size) return null
         val aweme = awemeList[index]
         val bitRates = aweme.video?.bitRate
         if (bitRates.isNullOrEmpty()) return null
-        val playAddr = bitRates[0].playAddr
-        val urlList = playAddr?.urlList
-        val videoUrl = urlList?.find { it.contains("www.douyin.com") } ?: urlList?.firstOrNull()
-        return videoUrl?.let { uri ->
-            MediaItem.Builder()
-                .setUri(uri)
-                .setMediaId(aweme.awemeId)
-                .build()
+        val preferHevc = isHevcSupported()
+        val candidate = chooseBestCandidate(bitRates, preferHevc)
+        val urlList = candidate?.playAddr?.urlList
+        return urlList?.find { it.contains("www.douyin.com") } ?: urlList?.firstOrNull()
+    }
+
+
+    private fun chooseBestCandidate(bitRates: List<com.example.douyintv.data.BitRate>, preferHevc: Boolean): com.example.douyintv.data.BitRate? {
+        val available = bitRates.filter { !(it.playAddr?.urlList.isNullOrEmpty()) }
+        if (available.isEmpty()) return null
+
+        val hevcList = available.filter { (it.isH265 ?: 0) == 1 }
+        val avcList = available.filter { (it.isH265 ?: 0) == 0 }
+
+        val primary = if (preferHevc) hevcList else avcList
+        val secondary = if (preferHevc) avcList else hevcList
+
+        // Sort by resolution (height) desc, then bitrate desc
+        fun sorted(list: List<com.example.douyintv.data.BitRate>) = list.sortedWith(
+            compareByDescending<com.example.douyintv.data.BitRate> { it.height ?: 0 }
+                .thenByDescending { it.bitRateValue ?: 0 }
+        )
+
+        // Try primary codec set
+        for (br in sorted(primary)) {
+            val mime = if ((br.isH265 ?: 0) == 1) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264
+            val w = br.width ?: 0
+            val h = br.height ?: 0
+            val fps = (br.fps ?: br.fpsUpper ?: 0)
+            if (isVideoConfigSupportedForAnyDecoder(mime, w, h, fps)) return br
+        }
+
+        // Fallback to secondary codec set
+        for (br in sorted(secondary)) {
+            val mime = if ((br.isH265 ?: 0) == 1) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264
+            val w = br.width ?: 0
+            val h = br.height ?: 0
+            val fps = (br.fps ?: br.fpsUpper ?: 0)
+            if (isVideoConfigSupportedForAnyDecoder(mime, w, h, fps)) return br
+        }
+
+        // Final fallback: any available
+        return available.firstOrNull()
+    }
+
+    private fun isVideoConfigSupportedForAnyDecoder(mime: String, width: Int, height: Int, fps: Int): Boolean {
+        return try {
+            val list = MediaCodecList(MediaCodecList.ALL_CODECS)
+            list.codecInfos.any { info ->
+                if (info.isEncoder) return@any false
+                // Skip known software-only decoders when possible
+                val name = info.name.lowercase()
+                if (name.contains("omx.google") || name.contains("sw")) return@any false
+                val types = info.supportedTypes
+                if (!types.any { it.equals(mime, ignoreCase = true) }) return@any false
+                val caps = try { info.getCapabilitiesForType(mime) } catch (_: Throwable) { return@any false }
+                val videoCaps = caps.videoCapabilities ?: return@any false
+                val sizeOk = if (width > 0 && height > 0) videoCaps.isSizeSupported(width, height) else true
+                val fpsOk = if (fps > 0 && width > 0 && height > 0) {
+                    try {
+                        videoCaps.getSupportedFrameRatesFor(width, height).contains(fps.toDouble())
+                    } catch (_: Throwable) { true }
+                } else true
+                sizeOk && fpsOk
+            }
+        } catch (_: Exception) {
+            // Conservative: if detection fails, don't block candidate
+            true
+        }
+    }
+
+    private fun isHevcSupported(): Boolean {
+        hevcSupportedCache?.let { return it }
+        return try {
+            val list = MediaCodecList(MediaCodecList.ALL_CODECS)
+            val supported = list.codecInfos.any { info ->
+                !info.isEncoder && info.supportedTypes.any { it.equals("video/hevc", ignoreCase = true) } &&
+                    // 尽量排除纯软件解码器（低性能和兼容性差）
+                    (android.os.Build.VERSION.SDK_INT < 29 || !try { info.isSoftwareOnly } catch (e: Throwable) { false }) &&
+                    !info.name.lowercase().contains("omx.google") &&
+                    !info.name.lowercase().contains("sw")
+            }
+            hevcSupportedCache = supported
+            supported
+        } catch (_: Exception) {
+            hevcSupportedCache = false
+            false
         }
     }
 
@@ -165,12 +236,12 @@ class MainActivity : AppCompatActivity() {
             infoTitle.text = title
             infoDate.text = dateText
             infoOverlayContainer.visibility = View.VISIBLE
-            updateInfoOverlayMargin(timeBarVisible = timeBarContainer.visibility == View.VISIBLE)
+            updateInfoOverlayMargin()
             infoAutoHideJob?.cancel()
             infoAutoHideJob = lifecycleScope.launch(Dispatchers.Main) {
                 delay(3000)
                 // 若正在暂停，保持显示；否则隐藏
-                if (player.isPlaying) {
+                if (gsyPlayer.currentState == GSYVideoView.CURRENT_STATE_PLAYING) {
                     infoOverlayContainer.visibility = View.GONE
                 }
             }
@@ -207,54 +278,47 @@ class MainActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_DPAD_DOWN -> {
                 val nextIndex = currentIndex + 1
                 if (nextIndex < awemeList.size) {
-                    if (player.mediaItemCount >= 2 && player.currentMediaItemIndex == 0) {
-                        // 播放预加载的下一条
-                        player.seekToNextMediaItem()
-                        currentIndex = nextIndex
-                        // 维护播放列表：移除旧的前一条，追加下一条的下一条（实现滚动预加载）
-                        if (player.mediaItemCount > 1) {
-                            player.removeMediaItem(0)
-                        }
-                        val preloadItem = buildMediaItemForIndex(currentIndex + 1)
-                        if (preloadItem != null) {
-                            player.addMediaItem(preloadItem)
-                        }
-                        if (awemeList.size - currentIndex <= 2) {
-                            loadFeed()
-                        }
-                        showInfoOverlayForStart(currentIndex)
-                    } else {
-                        playVideo(nextIndex)
-                    }
+                    playVideo(nextIndex)
                 }
                 return true
             }
             KeyEvent.KEYCODE_DPAD_LEFT -> {
-                requestSeekBy(-SEEK_STEP_MS)
+                // 短按：小步长快退；长按：连续快退
+                val base = if (holdTargetPosition >= 0) holdTargetPosition else gsyPlayer.currentPositionWhenPlaying
+                val target = (base - SEEK_SHORT_MS).coerceAtLeast(0L)
+                holdTargetPosition = target
+                gsyPlayer.seekTo(target)
+                // 准备长按识别
+                event?.startTracking()
                 return true
             }
             KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                requestSeekBy(+SEEK_STEP_MS)
+                // 短按：小步长快进；长按：连续快进
+                val base = if (holdTargetPosition >= 0) holdTargetPosition else gsyPlayer.currentPositionWhenPlaying
+                val dur = gsyPlayer.duration
+                var target = base + SEEK_SHORT_MS
+                if (dur > 0) target = target.coerceAtMost(dur)
+                holdTargetPosition = target
+                gsyPlayer.seekTo(target)
+                // 准备长按识别
+                event?.startTracking()
                 return true
             }
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                if (player.isPlaying) {
-                    player.pause()
-                    showPauseOverlay()
-                    showTimeBar(autoHide = false)
+                if (gsyPlayer.currentState == GSYVideoView.CURRENT_STATE_PLAYING) {
+                    gsyPlayer.onVideoPause()
                     // 暂停时与时间轴一并展示标题与时间（分行）
                     val (title, dateText) = buildTitleAndDate(currentIndex)
                     infoTitle.text = title
                     infoDate.text = dateText
                     infoOverlayContainer.visibility = View.VISIBLE
-                    updateInfoOverlayMargin(timeBarVisible = true)
                     infoAutoHideJob?.cancel()
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 } else {
-                    player.play()
-                    hidePauseOverlay()
-                    hideTimeBar()
+                    gsyPlayer.onVideoResume()
                     // 恢复播放后隐藏标题
                     infoOverlayContainer.visibility = View.GONE
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
                 return true
             }
@@ -262,97 +326,68 @@ class MainActivity : AppCompatActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
+    override fun onKeyLongPress(keyCode: Int, event: KeyEvent?): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                startSeekHold(-1)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                startSeekHold(+1)
+                return true
+            }
+        }
+        return super.onKeyLongPress(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                stopSeekHold()
+                return true
+            }
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    private fun startSeekHold(direction: Int) {
+        seekHoldDirection = direction
+        seekHoldJob?.cancel()
+        seekHoldJob = lifecycleScope.launch(Dispatchers.Main) {
+            while (true) {
+                if (holdTargetPosition < 0) {
+                    holdTargetPosition = gsyPlayer.currentPositionWhenPlaying
+                }
+                val dur = gsyPlayer.duration
+                holdTargetPosition = if (direction < 0) {
+                    (holdTargetPosition - SEEK_LONG_STEP_MS).coerceAtLeast(0L)
+                } else {
+                    var t = holdTargetPosition + SEEK_LONG_STEP_MS
+                    if (dur > 0) t = t.coerceAtMost(dur)
+                    t
+                }
+                gsyPlayer.seekTo(holdTargetPosition)
+                delay(SEEK_LONG_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun stopSeekHold() {
+        seekHoldDirection = 0
+        seekHoldJob?.cancel()
+        seekHoldJob = null
+        holdTargetPosition = -1L
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        player.release()
+        // 清理常亮标志
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        GSYVideoManager.releaseAllVideos()
     }
 
-    private fun showPauseOverlay() {
-        pauseOverlay.visibility = View.VISIBLE
-    }
 
-    private fun hidePauseOverlay() {
-        pauseOverlay.visibility = View.GONE
-    }
-
-    private fun showTimeBar(autoHide: Boolean = true) {
-        val duration = player.duration
-        val position = player.currentPosition
-        val buffered = player.bufferedPosition
-
-        if (duration > 0) {
-            timeBar.setDuration(duration)
-            timeBar.setPosition(position)
-            timeBar.setBufferedPosition(buffered)
-            timeText.text = "${formatTime(position)} / ${formatTime(duration)}"
-        } else {
-            timeText.text = "--:-- / --:--"
-        }
-
-        timeBarContainer.visibility = View.VISIBLE
-        updateInfoOverlayMargin(timeBarVisible = true)
-        hideTimeBarJob?.cancel()
-        if (autoHide) {
-            hideTimeBarJob = lifecycleScope.launch(Dispatchers.Main) {
-                delay(2000)
-                timeBarContainer.visibility = View.GONE
-                updateInfoOverlayMargin(timeBarVisible = false)
-            }
-        } else {
-            hideTimeBarJob = null
-        }
-    }
-
-    private fun updateTimeBar(duration: Long, position: Long, buffered: Long = player.bufferedPosition) {
-        if (duration > 0) {
-            timeBar.setDuration(duration)
-            timeBar.setPosition(position)
-            timeBar.setBufferedPosition(buffered)
-            timeText.text = "${formatTime(position)} / ${formatTime(duration)}"
-        } else {
-            timeText.text = "--:-- / --:--"
-        }
-        timeBarContainer.visibility = View.VISIBLE
-        updateInfoOverlayMargin(timeBarVisible = true)
-    }
-
-    private fun requestSeekBy(offsetMs: Long) {
-        if (!player.isCurrentMediaItemSeekable) {
-            Toast.makeText(this, "当前视频不支持快进/后退", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        // 累积偏移，短暂去抖后合并一次 seek
-        pendingSeekOffsetMs += offsetMs
-        val duration = player.duration
-        val current = player.currentPosition
-        val targetPreview = calculateTargetPosition(current, pendingSeekOffsetMs, duration)
-        updateTimeBar(duration, targetPreview)
-
-        seekDebounceJob?.cancel()
-        seekDebounceJob = lifecycleScope.launch(Dispatchers.Main) {
-            delay(150)
-            val cur = player.currentPosition
-            val dur = player.duration
-            val target = calculateTargetPosition(cur, pendingSeekOffsetMs, dur)
-            pendingSeekOffsetMs = 0L
-            player.seekTo(target)
-            player.play() // 确保恢复播放
-            showTimeBar(autoHide = true) // 保持显示并启动自动隐藏计时
-        }
-    }
-
-    private fun calculateTargetPosition(current: Long, offset: Long, duration: Long): Long {
-        val base = current + offset
-        return if (duration > 0) base.coerceIn(0L, duration) else maxOf(0L, base)
-    }
-
-    private fun hideTimeBar() {
-        hideTimeBarJob?.cancel()
-        hideTimeBarJob = null
-        timeBarContainer.visibility = View.GONE
-        updateInfoOverlayMargin(timeBarVisible = false)
-    }
+    // 使用 StyledPlayerView 内置时间轴与快进后退，不再自定义时间轴逻辑
 
     private fun formatTime(ms: Long): String {
         val totalSeconds = ms / 1000
@@ -361,19 +396,10 @@ class MainActivity : AppCompatActivity() {
         return String.format("%02d:%02d", minutes, seconds)
     }
 
-    private fun updateInfoOverlayMargin(timeBarVisible: Boolean) {
+    private fun updateInfoOverlayMargin() {
         val params = infoOverlayContainer.layoutParams as FrameLayout.LayoutParams
-        if (timeBarVisible) {
-            // 在容器测量完成后设置与时间轴固定间距
-            timeBarContainer.post {
-                val spacingPx = dpToPx(8)
-                params.bottomMargin = timeBarContainer.height + spacingPx
-                infoOverlayContainer.layoutParams = params
-            }
-        } else {
-            params.bottomMargin = dpToPx(24)
-            infoOverlayContainer.layoutParams = params
-        }
+        params.bottomMargin = dpToPx(24)
+        infoOverlayContainer.layoutParams = params
     }
 
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()

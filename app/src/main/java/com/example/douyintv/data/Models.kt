@@ -20,7 +20,14 @@ data class Video(
 )
 
 data class BitRate(
-    @SerializedName("play_addr") val playAddr: PlayAddr?
+    @SerializedName("play_addr") val playAddr: PlayAddr?,
+    @SerializedName("is_h265") val isH265: Int?,
+    @SerializedName("bit_rate") val bitRateValue: Int?,
+    @SerializedName("width") val width: Int?,
+    @SerializedName("height") val height: Int?,
+    @SerializedName("fps") val fps: Int?,
+    @SerializedName("FPS") val fpsUpper: Int?,
+    @SerializedName("gear_name") val gearName: String?
 )
 
 data class PlayAddr(
