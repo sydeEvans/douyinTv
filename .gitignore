@@ -1,0 +1,51 @@
+# macOS
+.DS_Store
+
+# IDEs (Android Studio / IntelliJ / VS Code)
+*.iml
+.idea/
+.vscode/
+
+# Gradle
+.gradle/
+**/build/
+
+# Local SDK/Env config
+local.properties
+
+# Android build outputs
+*.apk
+*.ap_
+*.aab
+
+# ART/Dalvik/Java
+*.dex
+*.class
+
+# Legacy generated dirs (Eclipse/old setups)
+bin/
+gen/
+out/
+
+# Android Studio captures
+captures/
+
+# NDK/CMake
+**/.externalNativeBuild/
+**/.cxx/
+**/obj/
+
+# Logs and profiling
+*.log
+*.hprof
+
+# Keystores
+*.jks
+*.keystore
+
+# Firebase / Google services
+google-services.json
+
+# Misc editor/backup files
+*.swp
+*~
