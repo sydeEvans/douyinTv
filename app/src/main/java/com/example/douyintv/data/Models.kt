@@ -9,6 +9,8 @@ data class FeedResponse(
 data class Aweme(
     @SerializedName("aweme_id") val awemeId: String,
     @SerializedName("desc") val desc: String?,
+    @SerializedName("caption") val caption: String?,
+    @SerializedName("create_time") val createTime: Long?,
     @SerializedName("video") val video: Video?
 )
 
