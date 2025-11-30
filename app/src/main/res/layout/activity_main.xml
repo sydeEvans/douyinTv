@@ -14,12 +14,7 @@
         android:focusable="true"
         android:focusableInTouchMode="true" />
 
-    <ProgressBar
-        android:id="@+id/loading_bar"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="center"
-        android:indeterminateTint="#FFFFFF" />
+    <!-- 移除外层 loading 进度条，保持安静加载 -->
 
 
     <!-- 使用 StyledPlayerView 自带的控制器与时间轴，移除自定义时间轴容器 -->

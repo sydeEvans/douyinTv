@@ -28,7 +28,6 @@ import kotlinx.coroutines.withContext
 class MainActivity : AppCompatActivity() {
 
     private lateinit var gsyPlayer: StandardGSYVideoPlayer
-    private lateinit var loadingBar: ProgressBar
     private lateinit var infoOverlayContainer: LinearLayout
     private lateinit var infoTitle: TextView
     private lateinit var infoDate: TextView
@@ -62,7 +61,6 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         gsyPlayer = findViewById(R.id.gsy_player)
-        loadingBar = findViewById(R.id.loading_bar)
         infoOverlayContainer = findViewById(R.id.info_overlay_container)
         infoTitle = findViewById(R.id.info_title)
         infoDate = findViewById(R.id.info_date)
@@ -77,12 +75,14 @@ class MainActivity : AppCompatActivity() {
         gsyPlayer.isFocusableInTouchMode = true
         gsyPlayer.requestFocus()
         gsyPlayer.setDismissControlTime(2000)
+        // 尝试在初始化阶段隐藏内部不确定型 ProgressBar（GSY 内置 loading）
+        hideIndeterminateLoaders(gsyPlayer)
     }
 
     private fun loadFeed() {
         if (isLoading) return
         isLoading = true
-        loadingBar.visibility = View.VISIBLE
+        // 移除外层 loading，静默拉取 feed
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
@@ -99,7 +99,7 @@ class MainActivity : AppCompatActivity() {
                 
                 withContext(Dispatchers.Main) {
                     isLoading = false
-                    loadingBar.visibility = View.GONE
+                    // 无外层 loading 提示
                     
                     val newItems = response.awemeList?.filter { it.video != null } ?: emptyList()
                     if (newItems.isNotEmpty()) {
@@ -115,7 +115,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     isLoading = false
-                    loadingBar.visibility = View.GONE
+                    // 无外层 loading 提示
                     Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_LONG).show()
                     e.printStackTrace()
                 }
@@ -140,6 +140,8 @@ class MainActivity : AppCompatActivity() {
         lastTriedUrlIndexByIndex[index] = 0
         gsyPlayer.setUp(currentUrl, false, "")
         gsyPlayer.startPlayLogic()
+        // 隐藏内部 loading 视图
+        hideIndeterminateLoaders(gsyPlayer)
         // 播放时保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
@@ -177,16 +179,16 @@ class MainActivity : AppCompatActivity() {
         // 卡缓冲或错误监控：基于状态与进度，必要时做回退或跳转
         stallWatchdogJob = lifecycleScope.launch(Dispatchers.Main) {
             while (true) {
+                // 周期性隐藏内部不确定型 ProgressBar（避免库在缓冲态重新显示）
+                hideIndeterminateLoaders(gsyPlayer)
                 val state = gsyPlayer.currentState
                 val now = System.currentTimeMillis()
                 when (state) {
                     com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PLAYING -> {
-                        loadingBar.visibility = View.GONE
                         bufferingStartWallTime = -1L
                     }
                     com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PREPAREING,
                     com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PLAYING_BUFFERING_START -> {
-                        loadingBar.visibility = View.VISIBLE
                         if (bufferingStartWallTime < 0) bufferingStartWallTime = now
                         if (bufferingStartWallTime > 0 && now - bufferingStartWallTime >= 12_000) {
                             tryPlaybackFallbackOrSkip("buffering-timeout")
@@ -194,7 +196,6 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                     com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_ERROR -> {
-                        loadingBar.visibility = View.GONE
                         bufferingStartWallTime = -1L
                         tryPlaybackFallbackOrSkip("play-error")
                         return@launch
@@ -578,6 +579,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
+
+    private fun hideIndeterminateLoaders(view: View?) {
+        if (view == null) return
+        when (view) {
+            is android.view.ViewGroup -> {
+                for (i in 0 until view.childCount) {
+                    hideIndeterminateLoaders(view.getChildAt(i))
+                }
+            }
+            is ProgressBar -> {
+                if (view.isIndeterminate) {
+                    view.visibility = View.GONE
+                }
+            }
+        }
+    }
 
     private fun warmUpNext(nextIndex: Int) {
         if (nextIndex < 0 || nextIndex >= awemeList.size) return
