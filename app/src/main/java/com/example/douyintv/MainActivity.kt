@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var infoOverlayContainer: LinearLayout
     private lateinit var infoTitle: TextView
     private lateinit var infoDate: TextView
+    private lateinit var infoSeek: TextView
     private var infoAutoHideJob: Job? = null
     private var hevcSupportedCache: Boolean? = null
     private var firstFrameRendered: Boolean = false
@@ -42,6 +43,15 @@ class MainActivity : AppCompatActivity() {
     private var seekHoldJob: Job? = null
     private var seekHoldDirection: Int = 0 // -1: back, +1: forward
     private var holdTargetPosition: Long = -1L
+    private var seekHoldTicks: Int = 0
+    private var loadingWatchdogJob: Job? = null
+    private var stallWatchdogJob: Job? = null
+    private var lastProgressMs: Long = -1L
+    private var lastProgressUpdateWallTime: Long = 0L
+    private var bufferingStartWallTime: Long = -1L
+
+    private val lastTriedCandidateByIndex = mutableMapOf<Int, com.example.douyintv.data.BitRate>()
+    private val lastTriedUrlIndexByIndex = mutableMapOf<Int, Int>()
 
     private val awemeList = mutableListOf<Aweme>()
     private var currentIndex = 0
@@ -56,6 +66,7 @@ class MainActivity : AppCompatActivity() {
         infoOverlayContainer = findViewById(R.id.info_overlay_container)
         infoTitle = findViewById(R.id.info_title)
         infoDate = findViewById(R.id.info_date)
+        infoSeek = findViewById(R.id.info_seek)
 
         initializePlayer()
         loadFeed()
@@ -116,22 +127,109 @@ class MainActivity : AppCompatActivity() {
         if (index < 0 || index >= awemeList.size) return
         currentIndex = index
 
-        val currentUrl = buildUrlForIndex(index)
-        if (currentUrl == null) {
+        val preferHevc = isHevcSupported()
+        val candidate = buildCandidateForIndex(index, preferHevc)
+        val urls = buildUrlListForCandidate(candidate)
+        val currentUrl = urls.firstOrNull()
+        if (candidate == null || currentUrl == null) {
             Toast.makeText(this, "No valid video URL found", Toast.LENGTH_SHORT).show()
             return
         }
 
+        lastTriedCandidateByIndex[index] = candidate
+        lastTriedUrlIndexByIndex[index] = 0
         gsyPlayer.setUp(currentUrl, false, "")
         gsyPlayer.startPlayLogic()
         // 播放时保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // 启动容错看门狗：加载超时与长时间卡缓冲/错误时切下一条
+        startPlaybackWatchdogs()
 
         showInfoOverlayForStart(index)
 
         // Pagination: load more if 2nd to last
         if (awemeList.size - index <= 2) {
             loadFeed()
+        }
+
+        // 预解析下一条 URL 以预热连接
+        warmUpNext(index + 1)
+    }
+
+    private fun startPlaybackWatchdogs() {
+        // 取消旧的监控
+        loadingWatchdogJob?.cancel()
+        stallWatchdogJob?.cancel()
+        lastProgressMs = -1L
+        lastProgressUpdateWallTime = System.currentTimeMillis()
+        bufferingStartWallTime = -1L
+
+        // 加载超时：启动后若 8s 仍未进入播放态，则跳下一条
+        loadingWatchdogJob = lifecycleScope.launch(Dispatchers.Main) {
+            delay(8000)
+            val state = gsyPlayer.currentState
+            if (state != com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PLAYING) {
+                skipToNextVideo("load-timeout")
+            }
+        }
+
+        // 卡缓冲或错误监控：基于状态与进度，必要时做回退或跳转
+        stallWatchdogJob = lifecycleScope.launch(Dispatchers.Main) {
+            while (true) {
+                val state = gsyPlayer.currentState
+                val now = System.currentTimeMillis()
+                when (state) {
+                    com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PLAYING -> {
+                        loadingBar.visibility = View.GONE
+                        bufferingStartWallTime = -1L
+                    }
+                    com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PREPAREING,
+                    com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PLAYING_BUFFERING_START -> {
+                        loadingBar.visibility = View.VISIBLE
+                        if (bufferingStartWallTime < 0) bufferingStartWallTime = now
+                        if (bufferingStartWallTime > 0 && now - bufferingStartWallTime >= 12_000) {
+                            tryPlaybackFallbackOrSkip("buffering-timeout")
+                            return@launch
+                        }
+                    }
+                    com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_ERROR -> {
+                        loadingBar.visibility = View.GONE
+                        bufferingStartWallTime = -1L
+                        tryPlaybackFallbackOrSkip("play-error")
+                        return@launch
+                    }
+                }
+                if (state == com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PLAYING ||
+                    state == com.shuyu.gsyvideoplayer.video.base.GSYVideoView.CURRENT_STATE_PREPAREING) {
+                    val pos = gsyPlayer.currentPositionWhenPlaying
+                    if (lastProgressMs < 0 || pos != lastProgressMs) {
+                        lastProgressMs = pos
+                        lastProgressUpdateWallTime = now
+                    } else {
+                        if (now - lastProgressUpdateWallTime >= 15_000) {
+                            tryPlaybackFallbackOrSkip("stall-timeout")
+                            return@launch
+                        }
+                    }
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    private fun skipToNextVideo(reason: String) {
+        // 停止当前监控避免重复触发
+        loadingWatchdogJob?.cancel()
+        stallWatchdogJob?.cancel()
+        // 切换下一条
+        val nextIndex = currentIndex + 1
+        if (nextIndex < awemeList.size) {
+            playVideo(nextIndex)
+        } else {
+            // 触发拉取下一页并提示
+            loadFeed()
+            Toast.makeText(this, "Skipping: $reason", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -144,6 +242,18 @@ class MainActivity : AppCompatActivity() {
         val candidate = chooseBestCandidate(bitRates, preferHevc)
         val urlList = candidate?.playAddr?.urlList
         return urlList?.find { it.contains("www.douyin.com") } ?: urlList?.firstOrNull()
+    }
+
+    private fun buildCandidateForIndex(index: Int, preferHevc: Boolean): com.example.douyintv.data.BitRate? {
+        val aweme = awemeList.getOrNull(index) ?: return null
+        val bitRates = aweme.video?.bitRate ?: return null
+        return chooseBestCandidate(bitRates, preferHevc)
+    }
+
+    private fun buildUrlListForCandidate(candidate: com.example.douyintv.data.BitRate?): List<String> {
+        val list = candidate?.playAddr?.urlList ?: emptyList()
+        val primary = list.find { it.contains("www.douyin.com") }
+        return if (primary == null) list else listOf(primary) + list.filter { it != primary }
     }
 
 
@@ -288,6 +398,7 @@ class MainActivity : AppCompatActivity() {
                 val target = (base - SEEK_SHORT_MS).coerceAtLeast(0L)
                 holdTargetPosition = target
                 gsyPlayer.seekTo(target)
+                showSeekOverlay(-SEEK_SHORT_MS, target, gsyPlayer.duration)
                 // 准备长按识别
                 event?.startTracking()
                 return true
@@ -300,6 +411,7 @@ class MainActivity : AppCompatActivity() {
                 if (dur > 0) target = target.coerceAtMost(dur)
                 holdTargetPosition = target
                 gsyPlayer.seekTo(target)
+                showSeekOverlay(+SEEK_SHORT_MS, target, dur)
                 // 准备长按识别
                 event?.startTracking()
                 return true
@@ -353,20 +465,33 @@ class MainActivity : AppCompatActivity() {
     private fun startSeekHold(direction: Int) {
         seekHoldDirection = direction
         seekHoldJob?.cancel()
+        seekHoldTicks = 0
+        // 显示当前进度叠层
+        infoOverlayContainer.visibility = View.VISIBLE
+        infoSeek.visibility = View.VISIBLE
         seekHoldJob = lifecycleScope.launch(Dispatchers.Main) {
             while (true) {
                 if (holdTargetPosition < 0) {
                     holdTargetPosition = gsyPlayer.currentPositionWhenPlaying
                 }
                 val dur = gsyPlayer.duration
+                // 自适应步长：按住时间越久步长增至 10-15s
+                val step = when {
+                    seekHoldTicks >= 20 -> 15_000L
+                    seekHoldTicks >= 10 -> 10_000L
+                    else -> SEEK_LONG_STEP_MS
+                }
                 holdTargetPosition = if (direction < 0) {
-                    (holdTargetPosition - SEEK_LONG_STEP_MS).coerceAtLeast(0L)
+                    (holdTargetPosition - step).coerceAtLeast(0L)
                 } else {
-                    var t = holdTargetPosition + SEEK_LONG_STEP_MS
+                    var t = holdTargetPosition + step
                     if (dur > 0) t = t.coerceAtMost(dur)
                     t
                 }
                 gsyPlayer.seekTo(holdTargetPosition)
+                // 更新叠层时间显示
+                showSeekOverlay(if (direction < 0) -step else step, holdTargetPosition, dur)
+                seekHoldTicks++
                 delay(SEEK_LONG_INTERVAL_MS)
             }
         }
@@ -377,6 +502,12 @@ class MainActivity : AppCompatActivity() {
         seekHoldJob?.cancel()
         seekHoldJob = null
         holdTargetPosition = -1L
+        seekHoldTicks = 0
+        // 播放态则隐藏叠层
+        if (gsyPlayer.currentState == GSYVideoView.CURRENT_STATE_PLAYING) {
+            infoSeek.visibility = View.GONE
+            infoOverlayContainer.visibility = View.GONE
+        }
     }
 
     override fun onDestroy() {
@@ -384,6 +515,28 @@ class MainActivity : AppCompatActivity() {
         // 清理常亮标志
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         GSYVideoManager.releaseAllVideos()
+        loadingWatchdogJob?.cancel()
+        stallWatchdogJob?.cancel()
+        seekHoldJob?.cancel()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (gsyPlayer.currentState != GSYVideoView.CURRENT_STATE_PLAYING) {
+            gsyPlayer.onVideoResume()
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            startPlaybackWatchdogs()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (gsyPlayer.currentState == GSYVideoView.CURRENT_STATE_PLAYING) {
+            gsyPlayer.onVideoPause()
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        loadingWatchdogJob?.cancel()
+        stallWatchdogJob?.cancel()
     }
 
 
@@ -396,6 +549,28 @@ class MainActivity : AppCompatActivity() {
         return String.format("%02d:%02d", minutes, seconds)
     }
 
+    private fun showSeekOverlay(deltaMs: Long, targetMs: Long, durationMs: Long) {
+        val dur = if (durationMs > 0) durationMs else 0L
+        val arrow = if (deltaMs >= 0) "+" else "-"
+        val deltaS = kotlin.math.abs(deltaMs / 1000)
+        val text = if (dur > 0) {
+            "${formatTime(targetMs)} / ${formatTime(dur)} (${arrow}${deltaS}s)"
+        } else {
+            "${formatTime(targetMs)} (${arrow}${deltaS}s)"
+        }
+        infoSeek.text = text
+        infoSeek.visibility = View.VISIBLE
+        infoOverlayContainer.visibility = View.VISIBLE
+        infoAutoHideJob?.cancel()
+        infoAutoHideJob = lifecycleScope.launch(Dispatchers.Main) {
+            delay(1000)
+            if (gsyPlayer.currentState == GSYVideoView.CURRENT_STATE_PLAYING && seekHoldDirection == 0) {
+                infoSeek.visibility = View.GONE
+                infoOverlayContainer.visibility = View.GONE
+            }
+        }
+    }
+
     private fun updateInfoOverlayMargin() {
         val params = infoOverlayContainer.layoutParams as FrameLayout.LayoutParams
         params.bottomMargin = dpToPx(24)
@@ -403,4 +578,83 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
+
+    private fun warmUpNext(nextIndex: Int) {
+        if (nextIndex < 0 || nextIndex >= awemeList.size) return
+        val bitRates = awemeList[nextIndex].video?.bitRate ?: return
+        val candidate = chooseBestCandidate(bitRates, isHevcSupported())
+        val url = candidate?.playAddr?.urlList?.firstOrNull() ?: return
+        lifecycleScope.launch(Dispatchers.IO) {
+            warmUpUrl(url)
+        }
+    }
+
+    private fun warmUpUrl(url: String) {
+        try {
+            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "HEAD"
+            conn.connectTimeout = 3000
+            conn.readTimeout = 3000
+            conn.connect()
+            conn.inputStream?.close()
+            conn.disconnect()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun tryPlaybackFallbackOrSkip(reason: String) {
+        val index = currentIndex
+        val aweme = awemeList.getOrNull(index) ?: return skipToNextVideo(reason)
+        val bitRates = aweme.video?.bitRate ?: return skipToNextVideo(reason)
+        val current = lastTriedCandidateByIndex[index]
+        val preferHevcCurrent = (current?.isH265 ?: 0) == 1
+
+        fun sorted(list: List<com.example.douyintv.data.BitRate>) = list.sortedWith(
+            compareByDescending<com.example.douyintv.data.BitRate> { it.height ?: 0 }
+                .thenByDescending { it.bitRateValue ?: 0 }
+        )
+
+        val hevcList = bitRates.filter { (it.isH265 ?: 0) == 1 }
+        val avcList = bitRates.filter { (it.isH265 ?: 0) == 0 }
+        val primary = if (preferHevcCurrent) hevcList else avcList
+        val secondary = if (preferHevcCurrent) avcList else hevcList
+        val primarySorted = sorted(primary)
+        val secondarySorted = sorted(secondary)
+
+        val nextPrimary = if (current != null) {
+            val idx = primarySorted.indexOfFirst { it == current }
+            if (idx >= 0 && idx + 1 < primarySorted.size) primarySorted[idx + 1] else null
+        } else primarySorted.firstOrNull()
+
+        val fallbackCandidate = nextPrimary ?: secondarySorted.firstOrNull()
+        if (fallbackCandidate != null && fallbackCandidate != current) {
+            val urls = buildUrlListForCandidate(fallbackCandidate)
+            val url = urls.firstOrNull()
+            if (url != null) {
+                lastTriedCandidateByIndex[index] = fallbackCandidate
+                lastTriedUrlIndexByIndex[index] = 0
+                gsyPlayer.setUp(url, false, "")
+                gsyPlayer.startPlayLogic()
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                startPlaybackWatchdogs()
+                Toast.makeText(this, "Fallback: $reason", Toast.LENGTH_SHORT).show()
+                return
+            }
+        }
+
+        val urls = current?.playAddr?.urlList ?: emptyList()
+        val lastUrlIdx = lastTriedUrlIndexByIndex[index] ?: 0
+        val nextUrlIdx = lastUrlIdx + 1
+        val altUrl = urls.getOrNull(nextUrlIdx)
+        if (altUrl != null) {
+            lastTriedUrlIndexByIndex[index] = nextUrlIdx
+            gsyPlayer.setUp(altUrl, false, "")
+            gsyPlayer.startPlayLogic()
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            startPlaybackWatchdogs()
+            Toast.makeText(this, "Retry alt URL: $reason", Toast.LENGTH_SHORT).show()
+        } else {
+            skipToNextVideo(reason)
+        }
+    }
 }

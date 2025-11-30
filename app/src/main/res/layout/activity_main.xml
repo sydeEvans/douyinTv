@@ -52,6 +52,15 @@
             android:textColor="#CCCCCC"
             android:textSize="12sp"
             tools:text="11月30日" />
+
+        <TextView
+            android:id="@+id/info_seek"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            android:visibility="gone"
+            tools:text="01:23 / 04:56 (+5s)" />
     </LinearLayout>
 
 </FrameLayout>
